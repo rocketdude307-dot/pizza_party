@@ -1,0 +1,347 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless Pizza Party Planner with RSVP, voting, dashboard, and order recommendations.
+
+Parameters:
+  PizzaPartyAppName:
+    Type: String
+    Default: pizza-party-planner
+    Description: App name prefix used in resource names.
+    MinLength: 3
+    MaxLength: 30
+    AllowedPattern: '^[a-z0-9-]+$'
+  AllowedOrigin:
+    Type: String
+    Default: '*'
+    Description: CORS allowed origin for API requests.
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-3-haiku-20240307-v1:0
+    Description: Optional Bedrock model ID for AI suggestions endpoint.
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 15
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref PizzaPartyTable
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+
+Resources:
+  PizzaPartyApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub '${PizzaPartyAppName}-api'
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type'"
+        AllowOrigin: !Sub "'${AllowedOrigin}'"
+
+  PizzaPartyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+
+  PartyProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${PizzaPartyAppName}-processor'
+      Description: Handles RSVP, pizza/topping votes, results aggregation, and AI hints.
+      Handler: index.handler
+      InlineCode: |
+        import os
+        import json
+        import math
+        import datetime
+        from collections import defaultdict
+
+        import boto3
+        from boto3.dynamodb.conditions import Key
+
+        ddb = boto3.resource('dynamodb')
+        table = ddb.Table(os.environ['TABLE_NAME'])
+        bedrock = boto3.client('bedrock-runtime')
+
+        def _response(status, body):
+            return {
+                "statusCode": status,
+                "headers": {
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*"
+                },
+                "body": json.dumps(body, default=str)
+            }
+
+        def _parse(event):
+            raw = event.get("body")
+            if not raw:
+                return {}
+            return json.loads(raw)
+
+        def create_vote(payload):
+            user = payload.get("userName", "anonymous")
+            pizzas = payload.get("pizzaTypes", [])
+            toppings = payload.get("toppings", [])
+            rsvp = payload.get("rsvp", "YES")
+            slices = int(payload.get("slicesPerPerson", 2))
+            now = datetime.datetime.utcnow().isoformat()
+            item = {
+                "pk": "PARTY#DEFAULT",
+                "sk": f"USER#{user}",
+                "userName": user,
+                "pizzaTypes": pizzas,
+                "toppings": toppings,
+                "rsvp": rsvp,
+                "slicesPerPerson": slices,
+                "updatedAt": now,
+            }
+            table.put_item(Item=item)
+            return _response(200, {"message": "Vote and RSVP saved", "item": item})
+
+        def summarize(_payload):
+            rows = table.query(KeyConditionExpression=Key('pk').eq('PARTY#DEFAULT')).get('Items', [])
+            pizza_counts = defaultdict(int)
+            topping_counts = defaultdict(int)
+            rsvp_yes = 0
+            slices_total = 0
+            attendees = []
+
+            for r in rows:
+                if r.get("rsvp") == "YES":
+                    rsvp_yes += 1
+                    slices_total += int(r.get("slicesPerPerson", 2))
+                    attendees.append(r.get("userName", "guest"))
+                    for p in r.get("pizzaTypes", []):
+                        pizza_counts[p] += 1
+                    for t in r.get("toppings", []):
+                        topping_counts[t] += 1
+
+            pizzas_needed = math.ceil(slices_total / 8) if slices_total > 0 else 0
+            sorted_pizzas = sorted(pizza_counts.items(), key=lambda x: x[1], reverse=True)
+            sorted_toppings = sorted(topping_counts.items(), key=lambda x: x[1], reverse=True)
+
+            recommendations = []
+            if pizzas_needed > 0:
+                choices = sorted_pizzas or [("Cheese", 1)]
+                total_votes = sum(count for _, count in choices)
+                allocated = 0
+                for index, (name, count) in enumerate(choices):
+                    if index == len(choices) - 1:
+                        qty = pizzas_needed - allocated
+                    else:
+                        qty = max(1, round((count / total_votes) * pizzas_needed))
+                        allocated += qty
+                    recommendations.append({"pizzaType": name, "quantity": max(0, qty)})
+
+            return _response(200, {
+                "rsvpYes": rsvp_yes,
+                "attendees": attendees,
+                "slicesTotal": slices_total,
+                "pizzasNeeded": pizzas_needed,
+                "pizzaVotes": dict(sorted_pizzas),
+                "toppingVotes": dict(sorted_toppings),
+                "recommendedOrder": recommendations
+            })
+
+        def ai_suggestions(payload):
+            summary = payload.get("summary", {})
+            prompt = f"Give a concise pizza order strategy from this JSON: {json.dumps(summary)}"
+            model_id = os.environ.get("BEDROCK_MODEL_ID")
+            try:
+                response = bedrock.invoke_model(
+                    modelId=model_id,
+                    body=json.dumps({
+                        "anthropic_version": "bedrock-2023-05-31",
+                        "max_tokens": 300,
+                        "messages": [{"role": "user", "content": prompt}]
+                    }),
+                    contentType="application/json",
+                    accept="application/json"
+                )
+                body = json.loads(response['body'].read())
+                text = body.get("content", [{}])[0].get("text", "No suggestion returned")
+            except Exception as e:
+                text = f"AI helper unavailable: {str(e)}"
+            return _response(200, {"suggestion": text})
+
+        def handler(event, _context):
+            method = event.get('httpMethod')
+            path = event.get('path', '')
+            payload = _parse(event)
+
+            if method == 'POST' and path.endswith('/vote'):
+                return create_vote(payload)
+            if method == 'GET' and path.endswith('/results'):
+                return summarize(payload)
+            if method == 'POST' and path.endswith('/ai'):
+                return ai_suggestions(payload)
+            return _response(404, {"message": "Route not found"})
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PizzaPartyTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: '*'
+      Events:
+        VoteEndpoint:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PizzaPartyApi
+            Path: /vote
+            Method: POST
+        ResultsEndpoint:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PizzaPartyApi
+            Path: /results
+            Method: GET
+        AiEndpoint:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PizzaPartyApi
+            Path: /ai
+            Method: POST
+
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${PizzaPartyAppName}-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: index.html
+
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub '${WebBucket.Arn}/*'
+
+  WebsiteIndexObject:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt StaticAssetWriterFunction.Arn
+      BucketName: !Ref WebBucket
+      ObjectKey: index.html
+      Content: !Sub |
+        <!doctype html>
+        <html><head>
+        <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+        <title>${PizzaPartyAppName}</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <style>body{font-family:Arial;margin:2rem;max-width:1000px}.card{padding:1rem;border:1px solid #ddd;border-radius:12px;margin-bottom:1rem}img{max-width:100%;border-radius:12px}</style>
+        </head><body>
+        <h1>🍕 ${PizzaPartyAppName}</h1>
+        <div class="card"><img alt="pizza party" src="https://images.unsplash.com/photo-1513104890138-7c749659a591?auto=format&fit=crop&w=1200&q=60"/></div>
+        <div class="card"><h3>RSVP + Vote</h3>
+        <input id="userName" placeholder="Your name"/>
+        <input id="slices" type="number" value="2" min="1" placeholder="Slices per person"/>
+        <p>Pizza type (comma separated): <input id="pizzaTypes" value="Cheese,Pepperoni"></p>
+        <p>Toppings (comma separated): <input id="toppings" value="Mushroom,Olives"></p>
+        <button onclick="submitVote()">Submit</button></div>
+        <div class="card"><h3>Dashboard</h3><button onclick="loadResults()">Refresh Results</button><pre id="summary"></pre><canvas id="pizzaChart"></canvas><canvas id="toppingChart"></canvas></div>
+        <script>
+          const api='${PizzaPartyApi}.execute-api.${AWS::Region}.amazonaws.com/prod';
+          let pizzaChart,toppingChart;
+          async function submitVote(){
+            const payload={userName:document.getElementById('userName').value||'guest',slicesPerPerson:parseInt(document.getElementById('slices').value||'2',10),rsvp:'YES',pizzaTypes:document.getElementById('pizzaTypes').value.split(',').map(x=>x.trim()).filter(Boolean),toppings:document.getElementById('toppings').value.split(',').map(x=>x.trim()).filter(Boolean)};
+            await fetch(`https://${api}/vote`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+            await loadResults();
+          }
+          async function loadResults(){
+            const r=await fetch(`https://${api}/results`); const data=await r.json();
+            document.getElementById('summary').textContent=JSON.stringify(data,null,2);
+            const pLabels=Object.keys(data.pizzaVotes||{}), pVals=Object.values(data.pizzaVotes||{});
+            const tLabels=Object.keys(data.toppingVotes||{}), tVals=Object.values(data.toppingVotes||{});
+            if(pizzaChart) pizzaChart.destroy(); if(toppingChart) toppingChart.destroy();
+            pizzaChart=new Chart(document.getElementById('pizzaChart'),{type:'bar',data:{labels:pLabels,datasets:[{label:'Pizza Votes',data:pVals}]}});
+            toppingChart=new Chart(document.getElementById('toppingChart'),{type:'pie',data:{labels:tLabels,datasets:[{label:'Toppings',data:tVals}]}});
+          }
+          loadResults();
+        </script>
+        </body></html>
+
+  StaticAssetWriterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${PizzaPartyAppName}-asset-writer'
+      Runtime: python3.11
+      Handler: index.handler
+      Timeout: 30
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref WebBucket
+      InlineCode: |
+        import json
+        import boto3
+        import urllib3
+
+        s3 = boto3.client('s3')
+        http = urllib3.PoolManager()
+
+        def send(event, context, status, data, physical_id="StaticAssetWriter"):
+            response_body = {
+                "Status": status,
+                "Reason": f"See CloudWatch Logs: {context.log_stream_name}",
+                "PhysicalResourceId": physical_id,
+                "StackId": event["StackId"],
+                "RequestId": event["RequestId"],
+                "LogicalResourceId": event["LogicalResourceId"],
+                "Data": data,
+            }
+            encoded = json.dumps(response_body).encode("utf-8")
+            http.request("PUT", event["ResponseURL"], body=encoded, headers={"content-type": ""})
+
+        def handler(event, context):
+            props = event.get("ResourceProperties", {})
+            bucket = props.get("BucketName")
+            key = props.get("ObjectKey")
+            content = props.get("Content", "")
+            try:
+                if event["RequestType"] in ["Create", "Update"]:
+                    s3.put_object(Bucket=bucket, Key=key, Body=content.encode("utf-8"), ContentType="text/html")
+                elif event["RequestType"] == "Delete":
+                    s3.delete_object(Bucket=bucket, Key=key)
+                send(event, context, "SUCCESS", {"Bucket": bucket, "Key": key})
+            except Exception as e:
+                send(event, context, "FAILED", {"Error": str(e)})
+                raise
+
+Outputs:
+  ApiEndpoint:
+    Description: API endpoint for app backend.
+    Value: !Sub 'https://${PizzaPartyApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  WebsiteURL:
+    Description: URL for static frontend.
+    Value: !GetAtt WebBucket.WebsiteURL
+  DynamoDBTableName:
+    Description: Table storing RSVP and vote data.
+    Value: !Ref PizzaPartyTable
